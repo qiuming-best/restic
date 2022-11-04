@@ -1,4 +1,5 @@
-//+build !windows
+//go:build !windows
+// +build !windows
 
 package restorer
 
@@ -18,7 +19,7 @@ func TestRestorerRestoreEmptyHardlinkedFileds(t *testing.T) {
 	repo, cleanup := repository.TestRepository(t)
 	defer cleanup()
 
-	_, id := saveSnapshot(t, repo, Snapshot{
+	sn, _ := saveSnapshot(t, repo, Snapshot{
 		Nodes: map[string]Node{
 			"dirtest": Dir{
 				Nodes: map[string]Node{
@@ -29,8 +30,7 @@ func TestRestorerRestoreEmptyHardlinkedFileds(t *testing.T) {
 		},
 	})
 
-	res, err := NewRestorer(context.TODO(), repo, id)
-	rtest.OK(t, err)
+	res := NewRestorer(context.TODO(), repo, sn, false)
 
 	res.SelectFilter = func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
 		return true, true
@@ -42,7 +42,7 @@ func TestRestorerRestoreEmptyHardlinkedFileds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	err = res.RestoreTo(ctx, tempdir)
+	err := res.RestoreTo(ctx, tempdir)
 	rtest.OK(t, err)
 
 	f1, err := os.Stat(filepath.Join(tempdir, "dirtest/file1"))
@@ -58,4 +58,14 @@ func TestRestorerRestoreEmptyHardlinkedFileds(t *testing.T) {
 	if ok1 && ok2 {
 		rtest.Equals(t, s1.Ino, s2.Ino)
 	}
+}
+
+func getBlockCount(t *testing.T, filename string) int64 {
+	fi, err := os.Stat(filename)
+	rtest.OK(t, err)
+	st := fi.Sys().(*syscall.Stat_t)
+	if st == nil {
+		return -1
+	}
+	return st.Blocks
 }

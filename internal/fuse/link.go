@@ -1,3 +1,4 @@
+//go:build darwin || freebsd || linux
 // +build darwin freebsd linux
 
 package fuse
@@ -19,7 +20,7 @@ type link struct {
 	inode uint64
 }
 
-func newLink(ctx context.Context, root *Root, inode uint64, node *restic.Node) (*link, error) {
+func newLink(root *Root, inode uint64, node *restic.Node) (*link, error) {
 	return &link{root: root, inode: inode, node: node}, nil
 }
 
@@ -40,6 +41,8 @@ func (l *link) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mtime = l.node.ModTime
 
 	a.Nlink = uint32(l.node.Links)
+	a.Size = uint64(len(l.node.LinkTarget))
+	a.Blocks = 1 + a.Size/blockSize
 
 	return nil
 }

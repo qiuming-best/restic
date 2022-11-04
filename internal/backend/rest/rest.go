@@ -14,9 +14,8 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/net/context/ctxhttp"
-
-	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/backend/layout"
+	"github.com/restic/restic/internal/backend/sema"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
@@ -29,10 +28,11 @@ var _ restic.Backend = &Backend{}
 
 // Backend uses the REST protocol to access data stored on a server.
 type Backend struct {
-	url    *url.URL
-	sem    *backend.Semaphore
-	client *http.Client
-	backend.Layout
+	url         *url.URL
+	connections uint
+	sem         sema.Semaphore
+	client      http.Client
+	layout.Layout
 }
 
 // the REST API protocol version is decided by HTTP request headers, these are the constants.
@@ -43,9 +43,7 @@ const (
 
 // Open opens the REST backend with the given config.
 func Open(cfg Config, rt http.RoundTripper) (*Backend, error) {
-	client := &http.Client{Transport: rt}
-
-	sem, err := backend.NewSemaphore(cfg.Connections)
+	sem, err := sema.New(cfg.Connections)
 	if err != nil {
 		return nil, err
 	}
@@ -57,10 +55,11 @@ func Open(cfg Config, rt http.RoundTripper) (*Backend, error) {
 	}
 
 	be := &Backend{
-		url:    cfg.URL,
-		client: client,
-		Layout: &backend.RESTLayout{URL: url, Join: path.Join},
-		sem:    sem,
+		url:         cfg.URL,
+		client:      http.Client{Transport: rt},
+		Layout:      &layout.RESTLayout{URL: url, Join: path.Join},
+		connections: cfg.Connections,
+		sem:         sem,
 	}
 
 	return be, nil
@@ -105,6 +104,10 @@ func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (*Backend, er
 	return be, nil
 }
 
+func (b *Backend) Connections() uint {
+	return b.connections
+}
+
 // Location returns this backend's location (the server's URL).
 func (b *Backend) Location() string {
 	return b.url.String()
@@ -113,6 +116,12 @@ func (b *Backend) Location() string {
 // Hasher may return a hash function for calculating a content hash for the backend
 func (b *Backend) Hasher() hash.Hash {
 	return nil
+}
+
+// HasAtomicReplace returns whether Save() can atomically replace files
+func (b *Backend) HasAtomicReplace() bool {
+	// rest-server prevents overwriting
+	return false
 }
 
 // Save stores data in the backend at the handle.
@@ -125,9 +134,10 @@ func (b *Backend) Save(ctx context.Context, h restic.Handle, rd restic.RewindRea
 	defer cancel()
 
 	// make sure that client.Post() cannot close the reader by wrapping it
-	req, err := http.NewRequest(http.MethodPost, b.Filename(h), ioutil.NopCloser(rd))
+	req, err := http.NewRequestWithContext(ctx,
+		http.MethodPost, b.Filename(h), ioutil.NopCloser(rd))
 	if err != nil {
-		return errors.Wrap(err, "NewRequest")
+		return errors.WithStack(err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Accept", ContentTypeV2)
@@ -137,7 +147,7 @@ func (b *Backend) Save(ctx context.Context, h restic.Handle, rd restic.RewindRea
 	req.ContentLength = rd.Length()
 
 	b.sem.GetToken()
-	resp, err := ctxhttp.Do(ctx, b.client, req)
+	resp, err := b.client.Do(req)
 	b.sem.ReleaseToken()
 
 	var cerr error
@@ -147,7 +157,7 @@ func (b *Backend) Save(ctx context.Context, h restic.Handle, rd restic.RewindRea
 	}
 
 	if err != nil {
-		return errors.Wrap(err, "client.Post")
+		return errors.WithStack(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -157,21 +167,20 @@ func (b *Backend) Save(ctx context.Context, h restic.Handle, rd restic.RewindRea
 	return errors.Wrap(cerr, "Close")
 }
 
-// ErrIsNotExist is returned whenever the requested file does not exist on the
+// notExistError is returned whenever the requested file does not exist on the
 // server.
-type ErrIsNotExist struct {
+type notExistError struct {
 	restic.Handle
 }
 
-func (e ErrIsNotExist) Error() string {
+func (e *notExistError) Error() string {
 	return fmt.Sprintf("%v does not exist", e.Handle)
 }
 
 // IsNotExist returns true if the error was caused by a non-existing file.
 func (b *Backend) IsNotExist(err error) bool {
-	err = errors.Cause(err)
-	_, ok := err.(ErrIsNotExist)
-	return ok
+	var e *notExistError
+	return errors.As(err, &e)
 }
 
 // Load runs fn with a reader that yields the contents of the file at h at the
@@ -257,9 +266,9 @@ func (b *Backend) openReader(ctx context.Context, h restic.Handle, length int, o
 		return nil, errors.Errorf("invalid length %d", length)
 	}
 
-	req, err := http.NewRequest("GET", b.Filename(h), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", b.Filename(h), nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "http.NewRequest")
+		return nil, errors.WithStack(err)
 	}
 
 	byteRange := fmt.Sprintf("bytes=%d-", offset)
@@ -271,7 +280,7 @@ func (b *Backend) openReader(ctx context.Context, h restic.Handle, length int, o
 	debug.Log("Load(%v) send range %v", h, byteRange)
 
 	b.sem.GetToken()
-	resp, err := ctxhttp.Do(ctx, b.client, req)
+	resp, err := b.client.Do(req)
 	b.sem.ReleaseToken()
 
 	if err != nil {
@@ -284,7 +293,7 @@ func (b *Backend) openReader(ctx context.Context, h restic.Handle, length int, o
 
 	if resp.StatusCode == http.StatusNotFound {
 		_ = resp.Body.Close()
-		return nil, ErrIsNotExist{h}
+		return nil, &notExistError{h}
 	}
 
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
@@ -309,17 +318,17 @@ func (b *Backend) Stat(ctx context.Context, h restic.Handle) (restic.FileInfo, e
 		return restic.FileInfo{}, backoff.Permanent(err)
 	}
 
-	req, err := http.NewRequest(http.MethodHead, b.Filename(h), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, b.Filename(h), nil)
 	if err != nil {
-		return restic.FileInfo{}, errors.Wrap(err, "NewRequest")
+		return restic.FileInfo{}, errors.WithStack(err)
 	}
 	req.Header.Set("Accept", ContentTypeV2)
 
 	b.sem.GetToken()
-	resp, err := ctxhttp.Do(ctx, b.client, req)
+	resp, err := b.client.Do(req)
 	b.sem.ReleaseToken()
 	if err != nil {
-		return restic.FileInfo{}, errors.Wrap(err, "client.Head")
+		return restic.FileInfo{}, errors.WithStack(err)
 	}
 
 	_, _ = io.Copy(ioutil.Discard, resp.Body)
@@ -329,7 +338,7 @@ func (b *Backend) Stat(ctx context.Context, h restic.Handle) (restic.FileInfo, e
 
 	if resp.StatusCode == http.StatusNotFound {
 		_ = resp.Body.Close()
-		return restic.FileInfo{}, ErrIsNotExist{h}
+		return restic.FileInfo{}, &notExistError{h}
 	}
 
 	if resp.StatusCode != 200 {
@@ -364,14 +373,14 @@ func (b *Backend) Remove(ctx context.Context, h restic.Handle) error {
 		return backoff.Permanent(err)
 	}
 
-	req, err := http.NewRequest("DELETE", b.Filename(h), nil)
+	req, err := http.NewRequestWithContext(ctx, "DELETE", b.Filename(h), nil)
 	if err != nil {
-		return errors.Wrap(err, "http.NewRequest")
+		return errors.WithStack(err)
 	}
 	req.Header.Set("Accept", ContentTypeV2)
 
 	b.sem.GetToken()
-	resp, err := ctxhttp.Do(ctx, b.client, req)
+	resp, err := b.client.Do(req)
 	b.sem.ReleaseToken()
 
 	if err != nil {
@@ -380,7 +389,7 @@ func (b *Backend) Remove(ctx context.Context, h restic.Handle) error {
 
 	if resp.StatusCode == http.StatusNotFound {
 		_ = resp.Body.Close()
-		return ErrIsNotExist{h}
+		return &notExistError{h}
 	}
 
 	if resp.StatusCode != 200 {
@@ -403,14 +412,14 @@ func (b *Backend) List(ctx context.Context, t restic.FileType, fn func(restic.Fi
 		url += "/"
 	}
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return errors.Wrap(err, "NewRequest")
+		return errors.WithStack(err)
 	}
 	req.Header.Set("Accept", ContentTypeV2)
 
 	b.sem.GetToken()
-	resp, err := ctxhttp.Do(ctx, b.client, req)
+	resp, err := b.client.Do(req)
 	b.sem.ReleaseToken()
 
 	if err != nil {

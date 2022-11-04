@@ -6,8 +6,12 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"sync"
+	"time"
 
 	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/backend/layout"
+	"github.com/restic/restic/internal/backend/sema"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
@@ -22,20 +26,47 @@ type b2Backend struct {
 	bucket       *b2.Bucket
 	cfg          Config
 	listMaxItems int
-	backend.Layout
-	sem *backend.Semaphore
+	layout.Layout
+	sem sema.Semaphore
 }
 
-const defaultListMaxItems = 1000
+// Billing happens in 1000 item granlarity, but we are more interested in reducing the number of network round trips
+const defaultListMaxItems = 10 * 1000
 
 // ensure statically that *b2Backend implements restic.Backend.
 var _ restic.Backend = &b2Backend{}
 
-func newClient(ctx context.Context, cfg Config, rt http.RoundTripper) (*b2.Client, error) {
-	opts := []b2.ClientOption{b2.Transport(rt)}
+type sniffingRoundTripper struct {
+	sync.Mutex
+	lastErr error
+	http.RoundTripper
+}
 
-	c, err := b2.NewClient(ctx, cfg.AccountID, cfg.Key, opts...)
+func (s *sniffingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	res, err := s.RoundTripper.RoundTrip(req)
 	if err != nil {
+		s.Lock()
+		s.lastErr = err
+		s.Unlock()
+	}
+	return res, err
+}
+
+func newClient(ctx context.Context, cfg Config, rt http.RoundTripper) (*b2.Client, error) {
+	sniffer := &sniffingRoundTripper{RoundTripper: rt}
+	opts := []b2.ClientOption{b2.Transport(sniffer)}
+
+	// if the connection B2 fails, this can cause the client to hang
+	// cancel the connection after a minute to at least provide some feedback to the user
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	c, err := b2.NewClient(ctx, cfg.AccountID, cfg.Key.Unwrap(), opts...)
+	if err == context.DeadlineExceeded {
+		if sniffer.lastErr != nil {
+			return nil, sniffer.lastErr
+		}
+		return nil, errors.New("connection to B2 failed")
+	} else if err != nil {
 		return nil, errors.Wrap(err, "b2.NewClient")
 	}
 	return c, nil
@@ -58,7 +89,7 @@ func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend
 		return nil, errors.Wrap(err, "Bucket")
 	}
 
-	sem, err := backend.NewSemaphore(cfg.Connections)
+	sem, err := sema.New(cfg.Connections)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +98,7 @@ func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend
 		client: client,
 		bucket: bucket,
 		cfg:    cfg,
-		Layout: &backend.DefaultLayout{
+		Layout: &layout.DefaultLayout{
 			Join: path.Join,
 			Path: cfg.Prefix,
 		},
@@ -99,7 +130,7 @@ func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backe
 		return nil, errors.Wrap(err, "NewBucket")
 	}
 
-	sem, err := backend.NewSemaphore(cfg.Connections)
+	sem, err := sema.New(cfg.Connections)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +139,7 @@ func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backe
 		client: client,
 		bucket: bucket,
 		cfg:    cfg,
-		Layout: &backend.DefaultLayout{
+		Layout: &layout.DefaultLayout{
 			Join: path.Join,
 			Path: cfg.Prefix,
 		},
@@ -133,6 +164,10 @@ func (be *b2Backend) SetListMaxItems(i int) {
 	be.listMaxItems = i
 }
 
+func (be *b2Backend) Connections() uint {
+	return be.cfg.Connections
+}
+
 // Location returns the location for the backend.
 func (be *b2Backend) Location() string {
 	return be.cfg.Bucket
@@ -143,9 +178,21 @@ func (be *b2Backend) Hasher() hash.Hash {
 	return nil
 }
 
+// HasAtomicReplace returns whether Save() can atomically replace files
+func (be *b2Backend) HasAtomicReplace() bool {
+	return true
+}
+
 // IsNotExist returns true if the error is caused by a non-existing file.
 func (be *b2Backend) IsNotExist(err error) bool {
-	return b2.IsNotExist(errors.Cause(err))
+	// blazer/b2 does not export its error types and values,
+	// so we can't use errors.{As,Is}.
+	for ; err != nil; err = errors.Unwrap(err) {
+		if b2.IsNotExist(err) {
+			return true
+		}
+	}
+	return false
 }
 
 // Load runs fn with a reader that yields the contents of the file at h at the
@@ -264,22 +311,30 @@ func (be *b2Backend) Remove(ctx context.Context, h restic.Handle) error {
 	be.sem.GetToken()
 	defer be.sem.ReleaseToken()
 
-	obj := be.bucket.Object(be.Filename(h))
-	err := obj.Delete(ctx)
-	// consider a file as removed if b2 informs us that it does not exist
-	if b2.IsNotExist(err) {
-		return nil
+	// the retry backend will also repeat the remove method up to 10 times
+	for i := 0; i < 3; i++ {
+		obj := be.bucket.Object(be.Filename(h))
+		err := obj.Delete(ctx)
+		if err == nil {
+			// keep deleting until we are sure that no leftover file versions exist
+			continue
+		}
+		// consider a file as removed if b2 informs us that it does not exist
+		if b2.IsNotExist(err) {
+			return nil
+		}
+		return errors.Wrap(err, "Delete")
 	}
 
-	return errors.Wrap(err, "Delete")
+	return errors.New("failed to delete all file versions")
 }
 
 type semLocker struct {
-	*backend.Semaphore
+	sema.Semaphore
 }
 
-func (sm semLocker) Lock()   { sm.GetToken() }
-func (sm semLocker) Unlock() { sm.ReleaseToken() }
+func (sm *semLocker) Lock()   { sm.GetToken() }
+func (sm *semLocker) Unlock() { sm.ReleaseToken() }
 
 // List returns a channel that yields all names of blobs of type t.
 func (be *b2Backend) List(ctx context.Context, t restic.FileType, fn func(restic.FileInfo) error) error {
@@ -289,7 +344,7 @@ func (be *b2Backend) List(ctx context.Context, t restic.FileType, fn func(restic
 	defer cancel()
 
 	prefix, _ := be.Basedir(t)
-	iter := be.bucket.List(ctx, b2.ListPrefix(prefix), b2.ListPageSize(be.listMaxItems), b2.ListLocker(semLocker{be.sem}))
+	iter := be.bucket.List(ctx, b2.ListPrefix(prefix), b2.ListPageSize(be.listMaxItems), b2.ListLocker(&semLocker{be.sem}))
 
 	for iter.Next() {
 		obj := iter.Object()
@@ -339,7 +394,7 @@ func (be *b2Backend) Delete(ctx context.Context) error {
 		}
 	}
 	err := be.Remove(ctx, restic.Handle{Type: restic.ConfigFile})
-	if err != nil && b2.IsNotExist(errors.Cause(err)) {
+	if err != nil && be.IsNotExist(err) {
 		err = nil
 	}
 

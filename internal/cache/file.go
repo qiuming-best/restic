@@ -43,7 +43,7 @@ type readCloser struct {
 // given handle. rd must be closed after use. If an error is returned, the
 // ReadCloser is nil.
 func (c *Cache) load(h restic.Handle, length int, offset int64) (io.ReadCloser, error) {
-	debug.Log("Load from cache: %v", h)
+	debug.Log("Load(%v, %v, %v) from cache", h, length, offset)
 	if !c.canBeCached(h.Type) {
 		return nil, errors.New("cannot be cached")
 	}
@@ -59,13 +59,14 @@ func (c *Cache) load(h restic.Handle, length int, offset int64) (io.ReadCloser, 
 		return nil, errors.WithStack(err)
 	}
 
-	if fi.Size() <= crypto.Extension {
+	size := fi.Size()
+	if size <= int64(crypto.CiphertextLength(0)) {
 		_ = f.Close()
 		_ = c.remove(h)
 		return nil, errors.Errorf("cached file %v is truncated, removing", h)
 	}
 
-	if fi.Size() < offset+int64(length) {
+	if size < offset+int64(length) {
 		_ = f.Close()
 		_ = c.remove(h)
 		return nil, errors.Errorf("cached file %v is too small, removing", h)
@@ -117,7 +118,7 @@ func (c *Cache) Save(h restic.Handle, rd io.Reader) error {
 		return errors.Wrap(err, "Copy")
 	}
 
-	if n <= crypto.Extension {
+	if n <= int64(crypto.CiphertextLength(0)) {
 		_ = f.Close()
 		_ = fs.Remove(f.Name())
 		debug.Log("trying to cache truncated file %v, removing", h)

@@ -59,7 +59,7 @@ func loadFirstSnapshot(t testing.TB, repo restic.Repository) *restic.Snapshot {
 }
 
 func loadTree(t testing.TB, repo restic.Repository, id restic.ID) *restic.Tree {
-	tree, err := repo.LoadTree(context.TODO(), id)
+	tree, err := restic.LoadTree(context.TODO(), repo, id)
 	rtest.OK(t, err)
 	return tree
 }
@@ -119,7 +119,7 @@ func TestFuseFile(t *testing.T) {
 	root := &Root{repo: repo, blobCache: bloblru.New(blobCacheSize)}
 
 	inode := fs.GenerateDynamicInode(1, "foo")
-	f, err := newFile(context.TODO(), root, inode, node)
+	f, err := newFile(root, inode, node)
 	rtest.OK(t, err)
 	of, err := f.Open(context.TODO(), nil, nil)
 	rtest.OK(t, err)
@@ -163,7 +163,7 @@ func TestFuseDir(t *testing.T) {
 	}
 	parentInode := fs.GenerateDynamicInode(0, "parent")
 	inode := fs.GenerateDynamicInode(1, "foo")
-	d, err := newDir(context.TODO(), root, inode, parentInode, node)
+	d, err := newDir(root, inode, parentInode, node)
 	rtest.OK(t, err)
 
 	// don't open the directory as that would require setting up a proper tree blob

@@ -1,8 +1,10 @@
+//go:build darwin || freebsd || linux
 // +build darwin freebsd linux
 
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,9 +56,9 @@ func waitForMount(t testing.TB, dir string) {
 
 func testRunMount(t testing.TB, gopts GlobalOptions, dir string) {
 	opts := MountOptions{
-		SnapshotTemplate: time.RFC3339,
+		TimeTemplate: time.RFC3339,
 	}
-	rtest.OK(t, runMount(opts, gopts, []string{dir}))
+	rtest.OK(t, runMount(context.TODO(), opts, gopts, []string{dir}))
 }
 
 func testRunUmount(t testing.TB, gopts GlobalOptions, dir string) {
@@ -118,7 +120,7 @@ func checkSnapshots(t testing.TB, global GlobalOptions, repo *repository.Reposit
 	}
 
 	for _, id := range snapshotIDs {
-		snapshot, err := restic.LoadSnapshot(global.ctx, repo, id)
+		snapshot, err := restic.LoadSnapshot(context.TODO(), repo, id)
 		rtest.OK(t, err)
 
 		ts := snapshot.Time.Format(time.RFC3339)
@@ -153,11 +155,13 @@ func TestMount(t *testing.T) {
 	}
 
 	env, cleanup := withTestEnvironment(t)
+	// must list snapshots more than once
+	env.gopts.backendTestHook = nil
 	defer cleanup()
 
 	testRunInit(t, env.gopts)
 
-	repo, err := OpenRepository(env.gopts)
+	repo, err := OpenRepository(context.TODO(), env.gopts)
 	rtest.OK(t, err)
 
 	checkSnapshots(t, env.gopts, repo, env.mountpoint, env.repo, []restic.ID{}, 0)
@@ -196,11 +200,13 @@ func TestMountSameTimestamps(t *testing.T) {
 	}
 
 	env, cleanup := withTestEnvironment(t)
+	// must list snapshots more than once
+	env.gopts.backendTestHook = nil
 	defer cleanup()
 
 	rtest.SetupTarTestFixture(t, env.base, filepath.Join("testdata", "repo-same-timestamps.tar.gz"))
 
-	repo, err := OpenRepository(env.gopts)
+	repo, err := OpenRepository(context.TODO(), env.gopts)
 	rtest.OK(t, err)
 
 	ids := []restic.ID{
